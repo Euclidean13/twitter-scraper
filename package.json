@@ -1,5 +1,6 @@
 {
-  "name": "@the-convocation/twitter-scraper",
+  "name": "@tony_wmm365/twitter-scraper",
+  "version": "0.19.0-fork.4",
   "description": "A port of n0madic/twitter-scraper to Node.js.",
   "keywords": [
     "x",
@@ -7,7 +8,6 @@
     "scraper",
     "crawler"
   ],
-  "version": "0.19.0",
   "main": "dist/default/cjs/index.js",
   "types": "./dist/types/index.d.ts",
   "exports": {
@@ -28,7 +28,6 @@
       "require": "./dist/cycletls/cjs/index.cjs"
     }
   },
-  "repository": "https://github.com/the-convocation/twitter-scraper.git",
   "author": "karashiiro <49822414+karashiiro@users.noreply.github.com>",
   "license": "MIT",
   "engines": {
@@ -105,5 +104,13 @@
       "eslint --cache --fix",
       "prettier --write"
     ]
+  },
+   "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Euclidean13/twitter-scraper.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "fork"
   }
 }

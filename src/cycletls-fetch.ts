@@ -1,6 +1,6 @@
 import initCycleTLS from 'cycletls';
-import { Headers } from 'headers-polyfill';
 import debug from 'debug';
+import { Headers } from 'headers-polyfill';
 
 const log = debug('twitter-scraper:cycletls');
 
@@ -32,10 +32,14 @@ export function cycleTLSExit() {
 /**
  * A fetch-compatible wrapper around CycleTLS that mimics Chrome's TLS fingerprint
  * to bypass Cloudflare and other bot detection systems.
+ *
+ * Extras supported in `init`:
+ *   - proxy?: string   // http(s)://user:pass@host:port
+ *   - timeout?: number // seconds
  */
 export async function cycleTLSFetch(
   input: RequestInfo | URL,
-  init?: RequestInit,
+  init?: RequestInit & { proxy?: string; timeout?: number },
 ): Promise<Response> {
   const instance = await initCycleTLSFetch();
 
@@ -44,7 +48,7 @@ export async function cycleTLSFetch(
       ? input
       : input instanceof URL
       ? input.toString()
-      : input.url;
+      : (input as Request).url;
   const method = (init?.method || 'GET').toUpperCase();
 
   log(`Making ${method} request to ${url}`);
@@ -58,10 +62,10 @@ export async function cycleTLSFetch(
       });
     } else if (Array.isArray(init.headers)) {
       init.headers.forEach(([key, value]) => {
-        headers[key] = value;
+        headers[key] = value as string;
       });
     } else {
-      Object.assign(headers, init.headers);
+      Object.assign(headers, init.headers as Record<string, string>);
     }
   }
 
@@ -72,13 +76,25 @@ export async function cycleTLSFetch(
       body = init.body;
     } else if (init.body instanceof URLSearchParams) {
       body = init.body.toString();
+    } else if (init.body instanceof Blob) {
+      body = await init.body.text();
     } else {
-      body = init.body.toString();
+      body = (init.body as any).toString?.() ?? String(init.body);
     }
   }
 
+  // Proxy & timeout (fallback to env vars if not passed)
+  const proxy =
+    init?.proxy ||
+    process.env.TW_PROXY_URL ||
+    process.env.HTTP_PROXY ||
+    process.env.http_proxy ||
+    '';
+
+  const timeout = typeof init?.timeout === 'number' ? init.timeout : undefined;
+
   // Use Chrome 120 JA3 fingerprint for maximum compatibility
-  const options = {
+  const options: any = {
     body,
     headers,
     // Chrome 120 on Windows 10
@@ -87,6 +103,14 @@ export async function cycleTLSFetch(
       headers['user-agent'] ||
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
   };
+
+  if (proxy) {
+    options.proxy = proxy;
+    log(`Using proxy for CycleTLS: ${proxy}`);
+  }
+  if (timeout) {
+    options.timeout = timeout; // in seconds
+  }
 
   try {
     const response = await instance(
@@ -103,13 +127,12 @@ export async function cycleTLSFetch(
     );
 
     // Convert CycleTLS response to fetch Response
-    // CycleTLS returns headers as an object
     const responseHeaders = new Headers();
     if (response.headers) {
       Object.entries(response.headers).forEach(([key, value]) => {
         if (Array.isArray(value)) {
           value.forEach((v) => {
-            responseHeaders.append(key, v);
+            responseHeaders.append(key, v as string);
           });
         } else if (typeof value === 'string') {
           responseHeaders.set(key, value);
@@ -117,8 +140,7 @@ export async function cycleTLSFetch(
       });
     }
 
-    // Get response body - cycletls provides helper methods, but we need the raw text
-    // The response object has a text() method that returns the body as text
+    // Body
     let responseBody = '';
     if (typeof response.text === 'function') {
       responseBody = await response.text();
@@ -126,14 +148,11 @@ export async function cycleTLSFetch(
       responseBody = (response as any).body;
     }
 
-    // Create a proper Response object using standard Response constructor
-    const fetchResponse = new Response(responseBody, {
+    return new Response(responseBody, {
       status: response.status,
-      statusText: '', // CycleTLS doesn't provide status text
+      statusText: '',
       headers: responseHeaders,
     });
-
-    return fetchResponse;
   } catch (error) {
     log(`CycleTLS request failed: ${error}`);
     throw error;

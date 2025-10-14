@@ -15,6 +15,9 @@ export interface TimelineUserResultRaw {
   rest_id?: string;
   legacy?: LegacyUserRaw;
   is_blue_verified?: boolean;
+  avatar?: {
+    image_url?: string;
+  };
 }
 
 export interface TimelineEntryItemContentRaw {
@@ -192,6 +195,17 @@ export function parseLegacyTweet(
     isRetweet: false,
     isPin: false,
     sensitiveContent: false,
+    userProfile: {
+      profileImageUrlHttps: user.profile_image_url_https,
+      profileBannerUrl: user.profile_banner_url,
+      createdAt: user.created_at,
+      favouritesCount: user.favourites_count,
+      followersCount: user.followers_count,
+      friendsCount: user.friends_count,
+      listedCount: user.listed_count,
+      mediaCount: user.media_count,
+      statusesCount: user.statuses_count,
+    },
   };
 
   if (tweet.created_at) {
