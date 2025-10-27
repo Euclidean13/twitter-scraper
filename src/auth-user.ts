@@ -1,14 +1,14 @@
-import { TwitterAuthOptions, TwitterGuestAuth } from './auth';
-import { requestApi } from './api';
-import { CookieJar } from 'tough-cookie';
-import { updateCookieJar } from './requests';
-import { Headers } from 'headers-polyfill';
-import { TwitterApiErrorRaw, AuthenticationError, ApiError } from './errors';
 import { Type, type Static } from '@sinclair/typebox';
 import { Check } from '@sinclair/typebox/value';
-import * as OTPAuth from 'otpauth';
-import { FetchParameters } from './api-types';
 import debug from 'debug';
+import { Headers } from 'headers-polyfill';
+import * as OTPAuth from 'otpauth';
+import { CookieJar } from 'tough-cookie';
+import { requestApi } from './api';
+import { FetchParameters } from './api-types';
+import { TwitterAuthOptions, TwitterGuestAuth } from './auth';
+import { ApiError, AuthenticationError, TwitterApiErrorRaw } from './errors';
+import { updateCookieJar } from './requests';
 
 const log = debug('twitter-scraper:auth-user');
 
@@ -34,6 +34,14 @@ export interface TwitterUserAuthFlowResponse {
   flow_token?: string;
   status?: string;
   subtasks?: TwitterUserAuthSubtask[];
+
+  // When risk is higher, Twitter can return a top-level js_instrumentation
+  // directive with a URL to fetch. You must fetch and echo that body.
+  js_instrumentation?: {
+    url: string;
+    timeout_ms: number;
+    next_link?: { link_type: string; link_id: string };
+  };
 }
 
 interface TwitterUserAuthVerifyCredentials {
@@ -67,116 +75,16 @@ export interface TwitterUserAuthCredentials {
 
 /**
  * The API interface provided to custom subtask handlers for interacting with the Twitter authentication flow.
- * This interface allows handlers to send flow requests and access the current flow token.
- *
- * The API is passed to each subtask handler and provides methods necessary for implementing
- * custom authentication subtasks. It abstracts away the low-level details of communicating
- * with Twitter's authentication API.
- *
- * @example
- * ```typescript
- * import { Scraper, FlowSubtaskHandler } from "@the-convocation/twitter-scraper";
- *
- * // A custom subtask handler that implements a hypothetical example subtask
- * const exampleHandler: FlowSubtaskHandler = async (subtaskId, response, credentials, api) => {
- *   // Process the example subtask somehow
- *   const data = await processExampleTask();
- *
- *   // Submit the processed data using the provided API
- *   return await api.sendFlowRequest({
- *     flow_token: api.getFlowToken(),
- *     subtask_inputs: [{
- *       subtask_id: subtaskId,
- *       example_data: {
- *         value: data,
- *         link: "next_link"
- *       }
- *     }]
- *   });
- * };
- *
- * const scraper = new Scraper();
- * scraper.registerAuthSubtaskHandler("ExampleSubtask", exampleHandler);
- * ```
  */
 export interface FlowSubtaskHandlerApi {
-  /**
-   * Send a flow request to the Twitter API.
-   * @param request The request object containing flow token and subtask inputs
-   * @returns The result of the flow task
-   */
   sendFlowRequest: (
     request: TwitterUserAuthFlowRequest,
   ) => Promise<FlowTokenResult>;
-  /**
-   * Gets the current flow token.
-   * @returns The current flow token
-   */
   getFlowToken: () => string;
 }
 
 /**
  * A handler function for processing Twitter authentication flow subtasks.
- * Library consumers can implement and register custom handlers for new or
- * existing subtask types using the Scraper.registerAuthSubtaskHandler method.
- *
- * Each subtask handler is called when its corresponding subtask ID is encountered
- * during the authentication flow. The handler receives the subtask ID, the previous
- * response data, the user's credentials, and an API interface for interacting with
- * the authentication flow.
- *
- * Handlers should process their specific subtask and return either a successful response
- * or an error. Success responses typically lead to the next subtask in the flow, while
- * errors will halt the authentication process.
- *
- * @param subtaskId - The identifier of the subtask being handled
- * @param previousResponse - The complete response from the previous authentication flow step
- * @param credentials - The user's authentication credentials including username, password, etc.
- * @param api - An interface providing methods to interact with the authentication flow
- * @returns A promise resolving to either a successful flow response or an error
- *
- * @example
- * ```typescript
- * import { Scraper, FlowSubtaskHandler } from "@the-convocation/twitter-scraper";
- *
- * // Custom handler for a hypothetical verification subtask
- * const verificationHandler: FlowSubtaskHandler = async (
- *   subtaskId,
- *   response,
- *   credentials,
- *   api
- * ) => {
- *   // Extract the verification data from the response
- *   const verificationData = response.subtasks?.[0].exampleData?.value;
- *   if (!verificationData) {
- *     return {
- *       status: 'error',
- *       err: new Error('No verification data found in response')
- *     };
- *   }
- *
- *   // Process the verification data somehow
- *   const result = await processVerification(verificationData);
- *
- *   // Submit the result using the flow API
- *   return await api.sendFlowRequest({
- *     flow_token: api.getFlowToken(),
- *     subtask_inputs: [{
- *       subtask_id: subtaskId,
- *       example_verification: {
- *         value: result,
- *         link: "next_link"
- *       }
- *     }]
- *   });
- * };
- *
- * const scraper = new Scraper();
- * scraper.registerAuthSubtaskHandler("ExampleVerificationSubtask", verificationHandler);
- *
- * // Later, when logging in...
- * await scraper.login("username", "password");
- * ```
  */
 export type FlowSubtaskHandler = (
   subtaskId: string,
@@ -198,8 +106,6 @@ export class TwitterUserAuth extends TwitterGuestAuth {
 
   /**
    * Register a custom subtask handler or override an existing one
-   * @param subtaskId The ID of the subtask to handle
-   * @param handler The handler function that processes the subtask
    */
   registerSubtaskHandler(subtaskId: string, handler: FlowSubtaskHandler): void {
     this.subtaskHandlers.set(subtaskId, handler);
@@ -235,6 +141,23 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       'LoginSuccessSubtask',
       this.handleSuccessSubtask.bind(this),
     );
+
+    // Explicit handlers for occasionally inserted subtasks so failures are clear
+    this.subtaskHandlers.set(
+      'EnterRecaptcha',
+      this.handleEnterRecaptcha.bind(this),
+    );
+    this.subtaskHandlers.set(
+      'PhoneVerification',
+      this.handlePhoneVerification.bind(this),
+    );
+    this.subtaskHandlers.set('SecurityKey', this.handleSecurityKey.bind(this));
+
+    // Best-effort pass-throughs for benign UI subtasks
+    this.subtaskHandlers.set('WaitSpinner', this.handleWaitSpinner.bind(this));
+    this.subtaskHandlers.set('GenericUrt', this.handleGenericUrt.bind(this));
+    this.subtaskHandlers.set('WebModal', this.handleWebModal.bind(this));
+    this.subtaskHandlers.set('OpenLink', this.handleOpenLink.bind(this));
   }
 
   async isLoggedIn(): Promise<boolean> {
@@ -242,10 +165,7 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       'https://api.x.com/1.1/account/verify_credentials.json',
       this,
     );
-    if (!res.success) {
-      return false;
-    }
-
+    if (!res.success) return false;
     const { value: verify } = res;
     return verify && !verify.errors?.length;
   }
@@ -257,6 +177,7 @@ export class TwitterUserAuth extends TwitterGuestAuth {
     twoFactorSecret?: string,
   ): Promise<void> {
     await this.updateGuestToken();
+    await this.seedCookies();
 
     const credentials: TwitterUserAuthCredentials = {
       username,
@@ -265,35 +186,57 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       twoFactorSecret,
     };
 
-    let next: FlowTokenResult = await this.initLogin();
-    while (next.status === 'success' && next.response.subtasks?.length) {
-      const flowToken = next.response.flow_token;
-      if (flowToken == null) {
-        // Should never happen
-        throw new Error('flow_token not found.');
-      }
+    const runOnce = async (): Promise<FlowTokenResult> => {
+      let next: FlowTokenResult = await this.initLogin();
 
-      const subtaskId = next.response.subtasks[0].subtask_id;
-      const handler = this.subtaskHandlers.get(subtaskId);
+      // tiny human-like delay after init
+      await this.sleep(200, 600);
 
-      if (handler) {
+      while (next.status === 'success' && next.response.subtasks?.length) {
+        const flowToken = next.response.flow_token;
+        if (flowToken == null) throw new Error('flow_token not found.');
+
+        const subtaskId = next.response.subtasks[0].subtask_id;
+        log(`Auth subtask: ${subtaskId}`);
+
+        const handler = this.subtaskHandlers.get(subtaskId);
+        if (!handler) throw new Error(`Unknown subtask ${subtaskId}`);
+
+        // small pacing between subtasks
+        await this.sleep(200, 600);
+
         next = await handler(subtaskId, next.response, credentials, {
           sendFlowRequest: this.executeFlowTask.bind(this),
-          getFlowToken: () => flowToken,
+          getFlowToken: () => flowToken!,
         });
-      } else {
-        throw new Error(`Unknown subtask ${subtaskId}`);
       }
+      return next;
+    };
+
+    // First attempt
+    let result = await runOnce();
+    if (result.status === 'success') return;
+
+    // If we failed with a 399-style AuthenticationError, try a single restart
+    const msg = String(result.err?.message ?? '');
+    const is399 =
+      /Auth 399|Authentication error \(399\)|generic incorrect\/risk/i.test(
+        msg,
+      );
+
+    if (is399) {
+      // brief cooloff to let cf_bm/ct0 stabilize
+      await this.sleep(1200, 1800);
+      await this.seedCookies();
+      result = await runOnce();
+      if (result.status === 'success') return;
     }
-    if (next.status === 'error') {
-      throw next.err;
-    }
+
+    throw result.err;
   }
 
   async logout(): Promise<void> {
-    if (!this.hasToken()) {
-      return;
-    }
+    if (!this.hasToken()) return;
 
     try {
       await requestApi<void>(
@@ -302,7 +245,6 @@ export class TwitterUserAuth extends TwitterGuestAuth {
         'POST',
       );
     } catch (error) {
-      // Ignore errors during logout but still clean up state
       console.warn('Error during logout:', error);
     } finally {
       this.deleteToken();
@@ -328,8 +270,20 @@ export class TwitterUserAuth extends TwitterGuestAuth {
     await this.installCsrfToken(headers);
   }
 
+  private async seedCookies(): Promise<void> {
+    try {
+      const res = await this.fetch('https://x.com/', {
+        method: 'GET',
+        credentials: 'include',
+      } as any);
+      await updateCookieJar(this.jar, res.headers);
+    } catch (e) {
+      log('Cookie pre-seed failed (continuing): %O', e);
+    }
+  }
+
   private async initLogin(): Promise<FlowTokenResult> {
-    // Reset certain session-related cookies because Twitter complains sometimes if we don't
+    // Leave ct0 and __cf_bm intact; wiping them causes intermittent 399s.
     this.removeCookie('twitter_ads_id=');
     this.removeCookie('ads_prefs=');
     this.removeCookie('_twitter_sess=');
@@ -340,9 +294,9 @@ export class TwitterUserAuth extends TwitterGuestAuth {
     this.removeCookie('twitter_ads_idb=');
     this.removeCookie('email_uid=');
     this.removeCookie('external_referer=');
-    this.removeCookie('ct0=');
+    // DO NOT REMOVE ct0
     this.removeCookie('aa_u=');
-    this.removeCookie('__cf_bm=');
+    // DO NOT REMOVE __cf_bm
 
     return await this.executeFlowTask({
       flow_name: 'login',
@@ -400,19 +354,61 @@ export class TwitterUserAuth extends TwitterGuestAuth {
     });
   }
 
+  // --- Subtasks ---
+
+  // IMPORTANT: actually fetch and echo the instrumentation payload if server asks for it.
   private async handleJsInstrumentationSubtask(
     subtaskId: string,
-    _prev: TwitterUserAuthFlowResponse,
+    prev: TwitterUserAuthFlowResponse,
     _credentials: TwitterUserAuthCredentials,
     api: FlowSubtaskHandlerApi,
   ): Promise<FlowTokenResult> {
+    const ins = prev.js_instrumentation;
+    let responsePayload = '{}';
+
+    if (ins?.url) {
+      try {
+        const budgetMs = Math.max(250, Math.min(ins.timeout_ms ?? 2000, 4000));
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), budgetMs);
+
+        const res = await this.fetch(ins.url, {
+          method: 'GET',
+          credentials: 'include',
+          headers: {
+            accept: '*/*',
+            referer: 'https://x.com/',
+          } as any,
+          signal: ctrl.signal,
+        } as any);
+
+        clearTimeout(t);
+        responsePayload = await res.text();
+        if (!responsePayload || responsePayload.trim() === '')
+          responsePayload = '{}';
+      } catch (e) {
+        log(
+          'JS instrumentation fetch failed, falling back to {}. Error: %O',
+          e,
+        );
+        responsePayload = '{}';
+      }
+    } else {
+      // low-risk path: send a non-empty minimal payload
+      responsePayload = JSON.stringify({
+        js: true,
+        ts: Date.now(),
+        rnd: Math.floor(Math.random() * 1e7),
+      });
+    }
+
     return await api.sendFlowRequest({
       flow_token: api.getFlowToken(),
       subtask_inputs: [
         {
           subtask_id: subtaskId,
           js_instrumentation: {
-            response: '{}',
+            response: responsePayload,
             link: 'next_link',
           },
         },
@@ -522,27 +518,37 @@ export class TwitterUserAuth extends TwitterGuestAuth {
     }
 
     const totp = new OTPAuth.TOTP({ secret: credentials.twoFactorSecret });
-    let error;
-    for (let attempts = 1; attempts < 4; attempts += 1) {
-      try {
-        return await api.sendFlowRequest({
-          flow_token: api.getFlowToken(),
-          subtask_inputs: [
-            {
-              subtask_id: subtaskId,
-              enter_text: {
-                link: 'next_link',
-                text: totp.generate(),
-              },
+    let lastError: FlowTokenResultError | undefined;
+
+    for (let attempts = 1; attempts <= 3; attempts++) {
+      const code = totp.generate();
+      const res = await api.sendFlowRequest({
+        flow_token: api.getFlowToken(),
+        subtask_inputs: [
+          {
+            subtask_id: subtaskId,
+            enter_text: {
+              link: 'next_link',
+              text: code,
             },
-          ],
-        });
-      } catch (err) {
-        error = err;
-        await new Promise((resolve) => setTimeout(resolve, 2000 * attempts));
-      }
+          },
+        ],
+      });
+
+      if (res.status === 'success') return res;
+
+      lastError = res;
+      await this.sleep(1000 * attempts, 1000 * attempts + 500); // roll into next TOTP window if near-edge
     }
-    throw error;
+
+    return (
+      lastError ?? {
+        status: 'error',
+        err: new AuthenticationError(
+          'Two-factor authentication failed after retries',
+        ),
+      }
+    );
   }
 
   private async handleAcid(
@@ -577,6 +583,120 @@ export class TwitterUserAuth extends TwitterGuestAuth {
     });
   }
 
+  // ----- Extra, explicit handlers -----
+
+  private async handleEnterRecaptcha(
+    _subtaskId: string,
+    _prev: TwitterUserAuthFlowResponse,
+    _credentials: TwitterUserAuthCredentials,
+    _api: FlowSubtaskHandlerApi,
+  ): Promise<FlowTokenResult> {
+    return {
+      status: 'error',
+      err: new AuthenticationError(
+        'Recaptcha challenge encountered. Interactive solving is required.',
+      ),
+    };
+  }
+
+  private async handlePhoneVerification(
+    _subtaskId: string,
+    _prev: TwitterUserAuthFlowResponse,
+    _credentials: TwitterUserAuthCredentials,
+    _api: FlowSubtaskHandlerApi,
+  ): Promise<FlowTokenResult> {
+    return {
+      status: 'error',
+      err: new AuthenticationError(
+        'Phone verification required for this login (SMS/Call).',
+      ),
+    };
+  }
+
+  private async handleSecurityKey(
+    _subtaskId: string,
+    _prev: TwitterUserAuthFlowResponse,
+    _credentials: TwitterUserAuthCredentials,
+    _api: FlowSubtaskHandlerApi,
+  ): Promise<FlowTokenResult> {
+    return {
+      status: 'error',
+      err: new AuthenticationError(
+        'Security key (FIDO/U2F) challenge required for this login.',
+      ),
+    };
+  }
+
+  private async handleWaitSpinner(
+    subtaskId: string,
+    _prev: TwitterUserAuthFlowResponse,
+    _credentials: TwitterUserAuthCredentials,
+    api: FlowSubtaskHandlerApi,
+  ): Promise<FlowTokenResult> {
+    return await api.sendFlowRequest({
+      flow_token: api.getFlowToken(),
+      subtask_inputs: [
+        {
+          subtask_id: subtaskId,
+          wait_spinner: { link: 'next_link' },
+        },
+      ],
+    });
+  }
+
+  private async handleGenericUrt(
+    subtaskId: string,
+    _prev: TwitterUserAuthFlowResponse,
+    _credentials: TwitterUserAuthCredentials,
+    api: FlowSubtaskHandlerApi,
+  ): Promise<FlowTokenResult> {
+    return await api.sendFlowRequest({
+      flow_token: api.getFlowToken(),
+      subtask_inputs: [
+        {
+          subtask_id: subtaskId,
+          generic_urt: { link: 'next_link' },
+        },
+      ],
+    });
+  }
+
+  private async handleWebModal(
+    subtaskId: string,
+    _prev: TwitterUserAuthFlowResponse,
+    _credentials: TwitterUserAuthCredentials,
+    api: FlowSubtaskHandlerApi,
+  ): Promise<FlowTokenResult> {
+    return await api.sendFlowRequest({
+      flow_token: api.getFlowToken(),
+      subtask_inputs: [
+        {
+          subtask_id: subtaskId,
+          web_modal: { link: 'next_link' },
+        },
+      ],
+    });
+  }
+
+  private async handleOpenLink(
+    subtaskId: string,
+    _prev: TwitterUserAuthFlowResponse,
+    _credentials: TwitterUserAuthCredentials,
+    api: FlowSubtaskHandlerApi,
+  ): Promise<FlowTokenResult> {
+    return await api.sendFlowRequest({
+      flow_token: api.getFlowToken(),
+      subtask_inputs: [
+        {
+          subtask_id: subtaskId,
+          open_link: { link: 'next_link' },
+        },
+      ],
+    });
+  }
+
+  // ----- Core task executor -----
+
   private async executeFlowTask(
     data: TwitterUserAuthFlowRequest,
   ): Promise<FlowTokenResult> {
@@ -594,6 +714,7 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       );
     }
 
+    // Keep UA and CH hints internally consistent; adjust as needed for your environment.
     const headers = new Headers({
       accept: '*/*',
       'accept-language': 'en-US,en;q=0.9',
@@ -634,14 +755,8 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       try {
         res = await this.fetch(...fetchParameters);
       } catch (err) {
-        if (!(err instanceof Error)) {
-          throw err;
-        }
-
-        return {
-          status: 'error',
-          err: err,
-        };
+        if (!(err instanceof Error)) throw err;
+        return { status: 'error', err };
       }
 
       await updateCookieJar(this.jar, res.headers);
@@ -660,6 +775,7 @@ export class TwitterUserAuth extends TwitterGuestAuth {
     }
 
     const flow: TwitterUserAuthFlowResponse = await res.json();
+
     if (flow?.flow_token == null) {
       return {
         status: 'error',
@@ -667,11 +783,21 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       };
     }
 
+    // Surface 399 explicitly so the caller can retry the whole flow once.
     if (flow.errors?.length) {
+      const e = flow.errors[0];
+      if (e.code === 399) {
+        return {
+          status: 'error',
+          err: new AuthenticationError(
+            `Auth 399 (generic incorrect/risk). Message=${e.message}`,
+          ),
+        };
+      }
       return {
         status: 'error',
         err: new AuthenticationError(
-          `Authentication error (${flow.errors[0].code}): ${flow.errors[0].message}`,
+          `Authentication error (${e.code}): ${e.message}`,
         ),
       };
     }
@@ -693,9 +819,13 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       };
     }
 
-    return {
-      status: 'success',
-      response: flow,
-    };
+    return { status: 'success', response: flow };
+  }
+
+  // ----- tiny helpers -----
+
+  private async sleep(minMs: number, maxMs: number): Promise<void> {
+    const ms = minMs + Math.floor(Math.random() * Math.max(0, maxMs - minMs));
+    return new Promise((r) => setTimeout(r, ms));
   }
 }
