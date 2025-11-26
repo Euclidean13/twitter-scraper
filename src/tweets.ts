@@ -1,4 +1,5 @@
 import { addApiFeatures, bearerToken2, requestApi } from './api';
+import { apiRequestFactory } from './api-data';
 import { TwitterAuth } from './auth';
 import { AuthenticationError } from './errors';
 import { getUserIdByScreenName } from './profile';
