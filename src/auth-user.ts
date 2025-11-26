@@ -4,11 +4,13 @@ import debug from 'debug';
 import { Headers } from 'headers-polyfill';
 import * as OTPAuth from 'otpauth';
 import { CookieJar } from 'tough-cookie';
-import { requestApi } from './api';
+import { flexParseJson, requestApi } from './api';
 import { FetchParameters } from './api-types';
 import { TwitterAuthOptions, TwitterGuestAuth } from './auth';
 import { ApiError, AuthenticationError, TwitterApiErrorRaw } from './errors';
 import { updateCookieJar } from './requests';
+import { generateTransactionId } from './xctxid';
+import { generateXPFFHeader } from './xpff';
 
 const log = debug('twitter-scraper:auth-user');
 
@@ -161,13 +163,8 @@ export class TwitterUserAuth extends TwitterGuestAuth {
   }
 
   async isLoggedIn(): Promise<boolean> {
-    const res = await requestApi<TwitterUserAuthVerifyCredentials>(
-      'https://api.x.com/1.1/account/verify_credentials.json',
-      this,
-    );
-    if (!res.success) return false;
-    const { value: verify } = res;
-    return verify && !verify.errors?.length;
+    const cookie = await this.getCookieString();
+    return cookie.includes('ct0=');
   }
 
   async login(
@@ -252,34 +249,36 @@ export class TwitterUserAuth extends TwitterGuestAuth {
     }
   }
 
-  async installCsrfToken(headers: Headers): Promise<void> {
-    const cookies = await this.getCookies();
-    const xCsrfToken = cookies.find((cookie) => cookie.key === 'ct0');
-    if (xCsrfToken) {
-      headers.set('x-csrf-token', xCsrfToken.value);
-    }
-  }
+  async installTo(
+    headers: Headers,
+    _url: string,
+    bearerTokenOverride?: string,
+  ): Promise<void> {
+    // Use the override token if provided, otherwise use the instance's bearer token
+    const tokenToUse = bearerTokenOverride ?? this.bearerToken;
+    headers.set('authorization', `Bearer ${tokenToUse}`);
+    headers.set(
+      'user-agent',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+    );
 
-  async installTo(headers: Headers): Promise<void> {
-    headers.set('authorization', `Bearer ${this.bearerToken}`);
-    const cookie = await this.getCookieString();
-    headers.set('cookie', cookie);
     if (this.guestToken) {
+      // Guest token is optional for authenticated users
       headers.set('x-guest-token', this.guestToken);
     }
-    await this.installCsrfToken(headers);
-  }
 
-  private async seedCookies(): Promise<void> {
-    try {
-      const res = await this.fetch('https://x.com/', {
-        method: 'GET',
-        credentials: 'include',
-      } as any);
-      await updateCookieJar(this.jar, res.headers);
-    } catch (e) {
-      log('Cookie pre-seed failed (continuing): %O', e);
+    await this.installCsrfToken(headers);
+
+    if (this.options?.experimental?.xpff) {
+      const guestId = await this.guestId();
+      if (guestId != null) {
+        const xpffHeader = await generateXPFFHeader(guestId);
+        headers.set('x-xp-forwarded-for', xpffHeader);
+      }
     }
+
+    const cookie = await this.getCookieString();
+    headers.set('cookie', cookie);
   }
 
   private async initLogin(): Promise<FlowTokenResult> {
@@ -571,131 +570,14 @@ export class TwitterUserAuth extends TwitterGuestAuth {
     });
   }
 
-  private async handleSuccessSubtask(
-    _subtaskId: string,
-    _prev: TwitterUserAuthFlowResponse,
-    _credentials: TwitterUserAuthCredentials,
-    api: FlowSubtaskHandlerApi,
-  ): Promise<FlowTokenResult> {
-    return await this.executeFlowTask({
-      flow_token: api.getFlowToken(),
-      subtask_inputs: [],
-    });
-  }
-
-  // ----- Extra, explicit handlers -----
-
-  private async handleEnterRecaptcha(
-    _subtaskId: string,
-    _prev: TwitterUserAuthFlowResponse,
-    _credentials: TwitterUserAuthCredentials,
-    _api: FlowSubtaskHandlerApi,
-  ): Promise<FlowTokenResult> {
+  private async handleSuccessSubtask(): Promise<FlowTokenResult> {
+    // Login completed successfully, nothing more to do
+    log('Successfully logged in with user credentials.');
     return {
-      status: 'error',
-      err: new AuthenticationError(
-        'Recaptcha challenge encountered. Interactive solving is required.',
-      ),
+      status: 'success',
+      response: {},
     };
   }
-
-  private async handlePhoneVerification(
-    _subtaskId: string,
-    _prev: TwitterUserAuthFlowResponse,
-    _credentials: TwitterUserAuthCredentials,
-    _api: FlowSubtaskHandlerApi,
-  ): Promise<FlowTokenResult> {
-    return {
-      status: 'error',
-      err: new AuthenticationError(
-        'Phone verification required for this login (SMS/Call).',
-      ),
-    };
-  }
-
-  private async handleSecurityKey(
-    _subtaskId: string,
-    _prev: TwitterUserAuthFlowResponse,
-    _credentials: TwitterUserAuthCredentials,
-    _api: FlowSubtaskHandlerApi,
-  ): Promise<FlowTokenResult> {
-    return {
-      status: 'error',
-      err: new AuthenticationError(
-        'Security key (FIDO/U2F) challenge required for this login.',
-      ),
-    };
-  }
-
-  private async handleWaitSpinner(
-    subtaskId: string,
-    _prev: TwitterUserAuthFlowResponse,
-    _credentials: TwitterUserAuthCredentials,
-    api: FlowSubtaskHandlerApi,
-  ): Promise<FlowTokenResult> {
-    return await api.sendFlowRequest({
-      flow_token: api.getFlowToken(),
-      subtask_inputs: [
-        {
-          subtask_id: subtaskId,
-          wait_spinner: { link: 'next_link' },
-        },
-      ],
-    });
-  }
-
-  private async handleGenericUrt(
-    subtaskId: string,
-    _prev: TwitterUserAuthFlowResponse,
-    _credentials: TwitterUserAuthCredentials,
-    api: FlowSubtaskHandlerApi,
-  ): Promise<FlowTokenResult> {
-    return await api.sendFlowRequest({
-      flow_token: api.getFlowToken(),
-      subtask_inputs: [
-        {
-          subtask_id: subtaskId,
-          generic_urt: { link: 'next_link' },
-        },
-      ],
-    });
-  }
-
-  private async handleWebModal(
-    subtaskId: string,
-    _prev: TwitterUserAuthFlowResponse,
-    _credentials: TwitterUserAuthCredentials,
-    api: FlowSubtaskHandlerApi,
-  ): Promise<FlowTokenResult> {
-    return await api.sendFlowRequest({
-      flow_token: api.getFlowToken(),
-      subtask_inputs: [
-        {
-          subtask_id: subtaskId,
-          web_modal: { link: 'next_link' },
-        },
-      ],
-    });
-  }
-
-  private async handleOpenLink(
-    subtaskId: string,
-    _prev: TwitterUserAuthFlowResponse,
-    _credentials: TwitterUserAuthCredentials,
-    api: FlowSubtaskHandlerApi,
-  ): Promise<FlowTokenResult> {
-    return await api.sendFlowRequest({
-      flow_token: api.getFlowToken(),
-      subtask_inputs: [
-        {
-          subtask_id: subtaskId,
-          open_link: { link: 'next_link' },
-        },
-      ],
-    });
-  }
-
-  // ----- Core task executor -----
 
   private async executeFlowTask(
     data: TwitterUserAuthFlowRequest,
@@ -706,15 +588,6 @@ export class TwitterUserAuth extends TwitterGuestAuth {
     }
 
     log(`Making POST request to ${onboardingTaskUrl}`);
-
-    const token = this.guestToken;
-    if (token == null) {
-      throw new AuthenticationError(
-        'Authentication token is null or undefined.',
-      );
-    }
-
-    // Keep UA and CH hints internally consistent; adjust as needed for your environment.
     const headers = new Headers({
       accept: '*/*',
       'accept-language': 'en-US,en;q=0.9',
@@ -733,12 +606,20 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       'sec-fetch-site': 'same-origin',
       'user-agent':
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
-      'x-guest-token': token,
       'x-twitter-auth-type': 'OAuth2Client',
       'x-twitter-active-user': 'yes',
       'x-twitter-client-language': 'en',
     });
-    await this.installTo(headers);
+    await this.installTo(headers, onboardingTaskUrl);
+
+    if (this.options?.experimental?.xClientTransactionId) {
+      const transactionId = await generateTransactionId(
+        onboardingTaskUrl,
+        this.fetch.bind(this),
+        'POST',
+      );
+      headers.set('x-client-transaction-id', transactionId);
+    }
 
     let res: Response;
     do {
@@ -774,8 +655,7 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       return { status: 'error', err: await ApiError.fromResponse(res) };
     }
 
-    const flow: TwitterUserAuthFlowResponse = await res.json();
-
+    const flow: TwitterUserAuthFlowResponse = await flexParseJson(res);
     if (flow?.flow_token == null) {
       return {
         status: 'error',

@@ -2,7 +2,7 @@ import { Cookie, CookieJar, MemoryCookieStore } from 'tough-cookie';
 import { updateCookieJar } from './requests';
 import { Headers } from 'headers-polyfill';
 import fetch from 'cross-fetch';
-import { FetchTransformOptions } from './api';
+import { FetchTransformOptions, flexParseJson } from './api';
 import {
   RateLimitEvent,
   RateLimitStrategy,
@@ -10,6 +10,7 @@ import {
 } from './rate-limit';
 import { AuthenticationError } from './errors';
 import debug from 'debug';
+import { generateXPFFHeader } from './xpff';
 
 const log = debug('twitter-scraper:auth');
 
@@ -17,6 +18,10 @@ export interface TwitterAuthOptions {
   fetch: typeof fetch;
   transform: Partial<FetchTransformOptions>;
   rateLimitStrategy: RateLimitStrategy;
+  experimental: {
+    xClientTransactionId?: boolean;
+    xpff?: boolean;
+  };
 }
 
 export interface TwitterAuth {
@@ -33,6 +38,9 @@ export interface TwitterAuth {
    */
   cookieJar(): CookieJar;
 
+  /**
+   * Returns the current cookies.
+   */
   getCookies(): Promise<Cookie[]>;
 
   /**
@@ -81,8 +89,14 @@ export interface TwitterAuth {
    * Installs the authentication information into a headers-like object. If needed, the
    * authentication token will be updated from the API automatically.
    * @param headers A Headers instance representing a request's headers.
+   * @param _url The URL being requested (currently unused, reserved for future use).
+   * @param bearerTokenOverride Optional bearer token to use instead of the default one.
    */
-  installTo(headers: Headers, url: string): Promise<void>;
+  installTo(
+    headers: Headers,
+    _url: string,
+    bearerTokenOverride?: string,
+  ): Promise<void>;
 }
 
 /**
@@ -119,7 +133,7 @@ export class TwitterGuestAuth implements TwitterAuth {
 
   constructor(
     bearerToken: string,
-    protected readonly options?: Partial<TwitterAuthOptions>,
+    readonly options?: Partial<TwitterAuthOptions>,
   ) {
     this.fetch = withTransform(options?.fetch ?? fetch, options?.transform);
     this.rateLimitStrategy =
@@ -168,28 +182,51 @@ export class TwitterGuestAuth implements TwitterAuth {
     return new Date(this.guestCreatedAt);
   }
 
-  async installTo(headers: Headers): Promise<void> {
-    if (this.shouldUpdate()) {
-      await this.updateGuestToken();
+  async installTo(
+    headers: Headers,
+    _url: string,
+    bearerTokenOverride?: string,
+  ): Promise<void> {
+    // Use the override token if provided, otherwise use the instance's bearer token
+    const tokenToUse = bearerTokenOverride ?? this.bearerToken;
+
+    // Only use guest tokens when not overriding the bearer token
+    // Guest tokens are tied to the bearer token they were generated with
+    if (!bearerTokenOverride) {
+      if (this.shouldUpdate()) {
+        await this.updateGuestToken();
+      }
+
+      if (this.guestToken) {
+        headers.set('x-guest-token', this.guestToken);
+      }
     }
 
-    const token = this.guestToken;
-    if (token == null) {
-      throw new AuthenticationError(
-        'Authentication token is null or undefined.',
-      );
+    headers.set('authorization', `Bearer ${tokenToUse}`);
+    headers.set(
+      'user-agent',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+    );
+
+    await this.installCsrfToken(headers);
+
+    if (this.options?.experimental?.xpff) {
+      const guestId = await this.guestId();
+      if (guestId != null) {
+        const xpffHeader = await generateXPFFHeader(guestId);
+        headers.set('x-xp-forwarded-for', xpffHeader);
+      }
     }
 
-    headers.set('authorization', `Bearer ${this.bearerToken}`);
-    headers.set('x-guest-token', token);
+    headers.set('cookie', await this.getCookieString());
+  }
 
+  async installCsrfToken(headers: Headers): Promise<void> {
     const cookies = await this.getCookies();
     const xCsrfToken = cookies.find((cookie) => cookie.key === 'ct0');
     if (xCsrfToken) {
       headers.set('x-csrf-token', xCsrfToken.value);
     }
-
-    headers.set('cookie', await this.getCookieString());
   }
 
   protected async setCookie(key: string, value: string): Promise<void> {
@@ -234,10 +271,24 @@ export class TwitterGuestAuth implements TwitterAuth {
       : 'https://x.com';
   }
 
+  protected async guestId(): Promise<string | null> {
+    const cookies = await this.getCookies();
+    const guestIdCookie = cookies.find((cookie) => cookie.key === 'guest_id');
+    return guestIdCookie ? guestIdCookie.value : null;
+  }
+
   /**
    * Updates the authentication state with a new guest token from the Twitter API.
    */
   protected async updateGuestToken() {
+    try {
+      await this.updateGuestTokenCore();
+    } catch (err) {
+      log('Failed to update guest token; this may cause issues:', err);
+    }
+  }
+
+  private async updateGuestTokenCore() {
     const guestActivateUrl = 'https://api.x.com/1.1/guest/activate.json';
 
     const headers = new Headers({
@@ -259,7 +310,7 @@ export class TwitterGuestAuth implements TwitterAuth {
       throw new AuthenticationError(await res.text());
     }
 
-    const o = await res.json();
+    const o = await flexParseJson<any>(res);
     if (o == null || o['guest_token'] == null) {
       throw new AuthenticationError('guest_token not found.');
     }

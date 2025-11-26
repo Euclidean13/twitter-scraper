@@ -1,5 +1,4 @@
-import { addApiFeatures, requestApi } from './api';
-import { apiRequestFactory } from './api-data';
+import { addApiFeatures, bearerToken2, requestApi } from './api';
 import { TwitterAuth } from './auth';
 import { AuthenticationError } from './errors';
 import { getUserIdByScreenName } from './profile';
@@ -132,9 +131,14 @@ export async function fetchTweets(
     userTweetsRequest.variables['cursor'] = cursor;
   }
 
+  // Use bearerToken2 for UserTweets endpoint
   const res = await requestApi<TimelineV2>(
     userTweetsRequest.toRequestUrl(),
     auth,
+    'GET',
+    undefined,
+    undefined,
+    bearerToken2,
   );
 
   if (!res.success) {
@@ -164,9 +168,14 @@ export async function fetchTweetsAndReplies(
     userTweetsRequest.variables['cursor'] = cursor;
   }
 
+  // Use bearerToken2 for UserTweetsAndReplies endpoint
   const res = await requestApi<TimelineV2>(
     userTweetsRequest.toRequestUrl(),
     auth,
+    'GET',
+    undefined,
+    undefined,
+    bearerToken2,
   );
 
   if (!res.success) {
@@ -194,9 +203,14 @@ export async function fetchListTweets(
     listTweetsRequest.variables['cursor'] = cursor;
   }
 
+  // Use bearerToken2 for ListTweet endpoint
   const res = await requestApi<ListTimeline>(
     listTweetsRequest.toRequestUrl(),
     auth,
+    'GET',
+    undefined,
+    undefined,
+    bearerToken2,
   );
 
   if (!res.success) {
@@ -287,9 +301,14 @@ export async function fetchLikedTweets(
     userTweetsRequest.variables['cursor'] = cursor;
   }
 
+  // Use bearerToken2 for UserLikedTweets endpoint
   const res = await requestApi<TimelineV2>(
     userTweetsRequest.toRequestUrl(),
     auth,
+    'GET',
+    undefined,
+    undefined,
+    bearerToken2,
   );
 
   if (!res.success) {
@@ -385,9 +404,15 @@ export async function getTweet(
   const tweetDetailRequest = apiRequestFactory.createTweetDetailRequest();
   tweetDetailRequest.variables.focalTweetId = id;
 
+  // Use bearerToken2 for this specific endpoint (TweetDetail)
+  // This is required for animated GIFs to appear in tweets with mixed media
   const res = await requestApi<ThreadedConversation>(
     tweetDetailRequest.toRequestUrl(),
     auth,
+    'GET',
+    undefined,
+    undefined,
+    bearerToken2,
   );
 
   if (!res.success) {
@@ -410,9 +435,16 @@ export async function getTweetAnonymous(
     apiRequestFactory.createTweetResultByRestIdRequest();
   tweetResultByRestIdRequest.variables.tweetId = id;
 
+  // Use bearerToken2 for this specific endpoint (TweetResultByRestId)
+  // This matches the behavior observed in the Twitter web client and Go library
+  // We pass it as an override to avoid mutating shared state (concurrency-safe)
   const res = await requestApi<TweetResultByRestId>(
     tweetResultByRestIdRequest.toRequestUrl(),
     auth,
+    'GET',
+    undefined,
+    undefined,
+    bearerToken2,
   );
 
   if (!res.success) {
