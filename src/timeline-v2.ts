@@ -18,6 +18,7 @@ export interface TimelineUserResultRaw {
   avatar?: {
     image_url?: string;
   };
+  core?: CoreUserRaw;
 }
 
 export interface TimelineEntryItemContentRaw {

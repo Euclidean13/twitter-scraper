@@ -5,15 +5,21 @@ on:
     types:
       - created
 
+permissions:
+  id-token: write  # Required for OIDC
+  contents: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
       - name: Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: 18.x
+          node-version: 22.x
+      - name: Update NPM
+        run: npm install -g npm
       - name: Yarn
         run: npm install -g yarn
       - name: Install
@@ -21,6 +27,4 @@ jobs:
       - name: Build
         run: yarn build
       - name: Publish
-        env:
-          NPM_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: yarn publish --access public
+        run: npm publish --access public
