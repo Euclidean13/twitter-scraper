@@ -2,8 +2,7 @@
 
 [![Documentation badge](https://img.shields.io/badge/docs-here-informational)](https://the-convocation.github.io/twitter-scraper/)
 
-A port of [n0madic/twitter-scraper](https://github.com/n0madic/twitter-scraper)
-to Node.js.
+A port of the now-archived [n0madic/twitter-scraper](https://github.com/n0madic/twitter-scraper) to Node.js.
 
 > Twitter's API is annoying to work with, and has lots of limitations — luckily
 > their frontend (JavaScript) has it's own API, which I reverse-engineered. No
@@ -11,12 +10,20 @@ to Node.js.
 >
 > You can use this library to get the text of any user's Tweets trivially.
 
-Known limitations:
+Many things have changed since X (the company formerly known as Twitter) was acquired in 2022:
 
-- Search operations require logging in with a real user account via
-  `scraper.login()`.
+- Several operations require logging in with a real user account via
+  `scraper.login()`. **While we are not aware of confirmed cases caused
+  by this library, any account you log into with this library is subject
+  to being banned at any time. You have been warned.**
 - Twitter's frontend API does in fact have rate limits
-  ([#11](https://github.com/the-convocation/twitter-scraper/issues/11))
+  ([#11](https://github.com/the-convocation/twitter-scraper/issues/11)).
+  The rate limits are dynamic and sometimes change, so we don't know
+  exactly what they are at all times. Refer to [rate limiting](#rate-limiting)
+  for more information.
+- Twitter's authentication requirements and frontend API endpoints
+  change frequently, breaking this library. Fixes for these issues
+  typically take at least a few days to go out.
 
 ## Installation
 
@@ -62,15 +69,15 @@ const scraper = new Scraper({
       // The arguments here are the same as the parameters to fetch(), and
       // are kept as-is for flexibility of both the library and applications.
       if (input instanceof URL) {
-        const proxy = "https://corsproxy.io/?" +
-          encodeURIComponent(input.toString());
+        const proxy =
+          'https://corsproxy.io/?' + encodeURIComponent(input.toString());
         return [proxy, init];
-      } else if (typeof input === "string") {
-        const proxy = "https://corsproxy.io/?" + encodeURIComponent(input);
+      } else if (typeof input === 'string') {
+        const proxy = 'https://corsproxy.io/?' + encodeURIComponent(input);
         return [proxy, init];
       } else {
         // Omitting handling for example
-        throw new Error("Unexpected request input type");
+        throw new Error('Unexpected request input type');
       }
     },
   },
@@ -87,10 +94,10 @@ front page).
 #### Next.js 13.x example:
 
 ```tsx
-"use client";
+'use client';
 
-import { Scraper, Tweet } from "@the-convocation/twitter-scraper";
-import { useEffect, useMemo, useState } from "react";
+import { Scraper, Tweet } from '@the-convocation/twitter-scraper';
+import { useEffect, useMemo, useState } from 'react';
 
 export default function Home() {
   const scraper = useMemo(
@@ -99,15 +106,15 @@ export default function Home() {
         transform: {
           request(input: RequestInfo | URL, init?: RequestInit) {
             if (input instanceof URL) {
-              const proxy = "https://corsproxy.io/?" +
-                encodeURIComponent(input.toString());
+              const proxy =
+                'https://corsproxy.io/?' + encodeURIComponent(input.toString());
               return [proxy, init];
-            } else if (typeof input === "string") {
-              const proxy = "https://corsproxy.io/?" +
-                encodeURIComponent(input);
+            } else if (typeof input === 'string') {
+              const proxy =
+                'https://corsproxy.io/?' + encodeURIComponent(input);
               return [proxy, init];
             } else {
-              throw new Error("Unexpected request input type");
+              throw new Error('Unexpected request input type');
             }
           },
         },
@@ -118,7 +125,7 @@ export default function Home() {
 
   useEffect(() => {
     async function getTweet() {
-      const latestTweet = await scraper.getLatestTweet("twitter");
+      const latestTweet = await scraper.getLatestTweet('twitter');
       if (latestTweet) {
         setTweet(latestTweet);
       }
@@ -159,11 +166,10 @@ supported directly by interceptors):
 const scraper = new Scraper({
   fetch: (input, init) => {
     // Transform input and init into your function's expected types...
-    return fetch(input, init)
-      .then((res) => {
-        // Transform res into a web-compliant response...
-        return res;
-      });
+    return fetch(input, init).then((res) => {
+      // Transform res into a web-compliant response...
+      return res;
+    });
   },
 });
 ```
@@ -186,7 +192,10 @@ yarn add cycletls
 
 ```ts
 import { Scraper } from '@the-convocation/twitter-scraper';
-import { cycleTLSFetch, cycleTLSExit } from '@the-convocation/twitter-scraper/cycletls';
+import {
+  cycleTLSFetch,
+  cycleTLSExit,
+} from '@the-convocation/twitter-scraper/cycletls';
 
 const scraper = new Scraper({
   fetch: cycleTLSFetch,
@@ -203,7 +212,66 @@ cycleTLSExit();
 
 See the [cycletls example](./examples/cycletls/) for a complete working example.
 
+### Cookie-based authentication
+
+If you're encountering `error 399` ("Incorrect. Please try again") or Twitter's suspicious activity detection during login, you can use cookies exported from an already-authenticated browser session instead. This approach:
+
+- Avoids Twitter's anti-bot protection that blocks automated logins
+- No need to store or handle passwords in code
+- Uses your established browser session
+- Bypasses rate limiting on authentication endpoints
+
+**Step 1: Export cookies from your browser**
+
+Using Chrome/Edge:
+
+1. Log in to X.com in your browser
+2. Open DevTools (F12) → Application tab → Cookies
+3. Click the URL bar that says "Filter cookies" and press Ctrl+A to select all cookies
+4. Copy all cookies (they'll be in format: `name1=value1; name2=value2; ...`)
+
+Using Firefox:
+
+1. Log in to X.com in your browser
+2. Open DevTools (F12) → Storage tab → Cookies → `https://x.com`
+3. Find the `ct0` cookie and copy its value
+4. Find the `auth_token` cookie and copy its value
+5. Construct the cookie string: `ct0=<value>; auth_token=<value>`
+
+> **Tip:** You can use the [Cookie-Editor](https://addons.mozilla.org/en-US/firefox/addon/cookie-editor/) extension to export cookies in a convenient format.
+
+**Step 2: Use cookies in your code**
+
+```ts
+import { Cookie } from 'tough-cookie';
+import { Scraper } from '@the-convocation/twitter-scraper';
+
+// Your cookie string from browser (name=value; name2=value2; ...)
+const cookieString = 'ct0=abc123; auth_token=xyz789; lang=en; ...';
+
+// Parse the cookie string
+const cookies = cookieString
+  .split(';')
+  .map((c) => Cookie.parse(c))
+  .filter(Boolean);
+
+// Create scraper and set cookies
+const scraper = new Scraper();
+await scraper.setCookies(cookies);
+
+// Verify authentication works
+const isLoggedIn = await scraper.isLoggedIn();
+if (isLoggedIn) {
+  console.log('✓ Successfully authenticated with cookies!');
+  // Now you can use authenticated features
+  const profile = await scraper.getProfile('username');
+}
+```
+
+Cookies expire over time. If authentication fails, you may need to export fresh cookies from your browser.
+
 ### Rate limiting
+
 The Twitter API heavily rate-limits clients, requiring that the scraper has its own
 rate-limit handling to behave predictably when rate-limiting occurs. By default, the
 scraper uses a rate-limiting strategy that waits for the current rate-limiting period
@@ -216,7 +284,7 @@ scrapers logged-in to different accounts (refer to [#116](https://github.com/the
 implementation to the `rateLimitStrategy` option in the scraper constructor:
 
 ```ts
-import { Scraper, RateLimitStrategy } from "@the-convocation/twitter-scraper";
+import { Scraper, RateLimitStrategy } from '@the-convocation/twitter-scraper';
 
 class CustomRateLimitStrategy implements RateLimitStrategy {
   async onRateLimit(event: RateLimitEvent): Promise<void> {
@@ -231,6 +299,7 @@ const scraper = new Scraper({
 
 More information on this interface can be found on the [`RateLimitStrategy`](https://the-convocation.github.io/twitter-scraper/interfaces/RateLimitStrategy.html)
 page in the documentation. The library provides two pre-written implementations to choose from:
+
 - `WaitingRateLimitStrategy`: The default, which waits for the limit to expire.
 - `ErrorRateLimitStrategy`: A strategy that throws if any rate-limit event occurs.
 
