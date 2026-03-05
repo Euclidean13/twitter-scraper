@@ -253,23 +253,10 @@ export class TwitterUserAuth extends TwitterGuestAuth {
     twoFactorSecret?: string,
   ): Promise<void> {
     // Pre-flight: visit x.com to establish Cloudflare cookies and session context.
-    // A real browser visits the page before starting the login API flow, and skipping
-    // this step can trigger Twitter's anti-bot detection (error 399).
-    // The preflight also extracts the guest token from the page HTML (via inline <script>
-    // that sets the `gt` cookie), matching real browser behavior where no separate
-    // guest/activate.json call is made.
     await this.preflight();
 
-    // Only call guest/activate.json if preflight didn't set the guest token.
-    // Real browsers get the guest token from inline JS in the login page HTML,
-    // not from a separate API call.
-    if (!this.guestToken) {
-      await this.updateGuestToken();
-    }
-
-    // IMPORTANT: Do NOT generate ct0 or send x-csrf-token during login.
-    // Real browsers do NOT have a ct0 cookie during the unauthenticated login flow.
-    // Sending x-csrf-token when the server doesn't expect it triggers bot detection (error 399).
+    // Always ensure we have a guest token via the activate endpoint.
+    await this.updateGuestToken();
 
     const credentials: TwitterUserAuthCredentials = {
       username,
@@ -278,43 +265,61 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       twoFactorSecret,
     };
 
-    let next: FlowTokenResult = await this.initLogin();
-    while (next.status === 'success' && next.response.subtasks?.length) {
-      const flowToken = next.response.flow_token;
-      if (flowToken == null) {
-        // Should never happen
-        throw new Error('flow_token not found.');
+    const runOnce = async (): Promise<FlowTokenResult> => {
+      let next: FlowTokenResult = await this.initLogin();
+
+      while (next.status === 'success' && next.response.subtasks?.length) {
+        const flowToken = next.response.flow_token;
+        if (flowToken == null) {
+          throw new Error('flow_token not found.');
+        }
+
+        const subtaskId = next.response.subtasks[0].subtask_id;
+
+        // Add a human-like delay between flow steps.
+        const configuredDelay = this.options?.experimental?.flowStepDelay;
+        const delay =
+          configuredDelay !== undefined
+            ? configuredDelay
+            : 200 + Math.floor(Math.random() * 400); // default: 200-600ms
+        if (delay > 0) {
+          log(`Waiting ${delay}ms before handling subtask: ${subtaskId}`);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+
+        const handler = this.subtaskHandlers.get(subtaskId);
+
+        if (handler) {
+          next = await handler(subtaskId, next.response, credentials, {
+            sendFlowRequest: this.executeFlowTask.bind(this),
+            getFlowToken: () => flowToken,
+          });
+        } else {
+          throw new Error(`Unknown subtask ${subtaskId}`);
+        }
       }
+      return next;
+    };
 
-      const subtaskId = next.response.subtasks[0].subtask_id;
+    // First attempt
+    let result = await runOnce();
+    if (result.status === 'success') return;
 
-      // Add a human-like delay between flow steps.
-      // Real browsers take 1-3 seconds between steps (page render, user reading, typing).
-      // Without this delay, Twitter flags the rapid-fire request pattern as bot activity (error 399).
-      const configuredDelay = this.options?.experimental?.flowStepDelay;
-      const delay =
-        configuredDelay !== undefined
-          ? configuredDelay
-          : 1000 + Math.floor(Math.random() * 2000); // default: 1-3 seconds
-      if (delay > 0) {
-        log(`Waiting ${delay}ms before handling subtask: ${subtaskId}`);
-        await new Promise((resolve) => setTimeout(resolve, delay));
-      }
+    // If we failed with a 399-style error, retry once after a cooloff
+    const msg = String(result.err?.message ?? '');
+    const is399 = /error 399|Auth 399|Authentication error \(399\)/i.test(msg);
 
-      const handler = this.subtaskHandlers.get(subtaskId);
-
-      if (handler) {
-        next = await handler(subtaskId, next.response, credentials, {
-          sendFlowRequest: this.executeFlowTask.bind(this),
-          getFlowToken: () => flowToken,
-        });
-      } else {
-        throw new Error(`Unknown subtask ${subtaskId}`);
-      }
+    if (is399) {
+      log('Got 399, retrying login after cooloff...');
+      await new Promise((r) =>
+        setTimeout(r, 1200 + Math.floor(Math.random() * 600)),
+      );
+      await this.updateGuestToken();
+      result = await runOnce();
+      if (result.status === 'success') return;
     }
-    if (next.status === 'error') {
-      throw next.err;
-    }
+
+    throw result.err;
   }
 
   /**
@@ -942,17 +947,13 @@ export class TwitterUserAuth extends TwitterGuestAuth {
         2,
       ),
     );
-    // Match exact headers observed from real Chrome browser during login flow.
-    // Notable absences vs authenticated requests: no cache-control, no pragma,
-    // no x-csrf-token, no x-twitter-auth-type, no x-xp-forwarded-for.
-    // We use installAuthCredentials() (not installTo()) to get only the auth
-    // essentials (bearer token, guest token, cookies) without browser headers
-    // that would need to be deleted afterwards.
     const headers = new Headers({
       accept: '*/*',
       'accept-language': 'en-US,en;q=0.9',
       'content-type': 'application/json',
+      'cache-control': 'no-cache',
       origin: 'https://x.com',
+      pragma: 'no-cache',
       priority: 'u=1, i',
       referer: 'https://x.com/',
       'sec-ch-ua': CHROME_SEC_CH_UA,
@@ -962,10 +963,12 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       'sec-fetch-mode': 'cors',
       'sec-fetch-site': 'same-site',
       'user-agent': CHROME_USER_AGENT,
+      'x-twitter-auth-type': 'OAuth2Client',
       'x-twitter-active-user': 'yes',
       'x-twitter-client-language': 'en',
     });
-    await this.installAuthCredentials(headers);
+    // Install bearer token, guest token, cookies, and CSRF token
+    await this.installTo(headers, onboardingTaskUrl);
 
     // Generate x-client-transaction-id if enabled - real browsers send this during login.
     if (this.options?.experimental?.xClientTransactionId) {
@@ -977,12 +980,6 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       headers.set('x-client-transaction-id', transactionId);
     }
 
-    // Strip flow_name from the body: real browsers only send it in the URL query parameter.
-    const bodyData: Record<string, unknown> = { ...data };
-    if ('flow_name' in bodyData) {
-      delete bodyData.flow_name;
-    }
-
     let res: Response;
     do {
       const fetchParameters: FetchParameters = [
@@ -991,7 +988,7 @@ export class TwitterUserAuth extends TwitterGuestAuth {
           credentials: 'include',
           method: 'POST',
           headers: headers,
-          body: JSON.stringify(bodyData),
+          body: JSON.stringify(data),
         },
       ];
 
