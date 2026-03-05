@@ -967,8 +967,10 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       'x-twitter-active-user': 'yes',
       'x-twitter-client-language': 'en',
     });
-    // Install bearer token, guest token, cookies, and CSRF token
-    await this.installTo(headers, onboardingTaskUrl);
+    // Install bearer token, guest token, cookies (but NOT the OAuth2Session
+    // auth-type that installTo() would add — during login we need OAuth2Client).
+    await this.installAuthCredentials(headers);
+    await this.installCsrfToken(headers);
 
     // Generate x-client-transaction-id if enabled - real browsers send this during login.
     if (this.options?.experimental?.xClientTransactionId) {
