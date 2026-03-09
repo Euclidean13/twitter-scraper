@@ -487,32 +487,64 @@ export class TwitterUserAuth extends TwitterGuestAuth {
     });
   }
 
+  // IMPORTANT: Fetch and echo the JS instrumentation payload if the server asks for it.
+  // The simpler approach (fetch URL → echo response text) works more reliably than
+  // trying to execute the script in a linkedom/vm sandbox.
   private async handleJsInstrumentationSubtask(
     subtaskId: string,
     prev: TwitterUserAuthFlowResponse,
     _credentials: TwitterUserAuthCredentials,
     api: FlowSubtaskHandlerApi,
   ): Promise<FlowTokenResult> {
-    // Extract the JS instrumentation URL from the subtask response.
-    // The script at this URL collects browser metrics (fingerprinting) that Twitter
-    // validates. Sending "{}" (empty) triggers bot detection (error 399).
+    // Look for the JS instrumentation URL in subtasks or top-level response
     const subtasks = prev.subtasks as {
       subtask_id: string;
-      js_instrumentation?: { url: string };
+      js_instrumentation?: { url: string; timeout_ms?: number };
     }[];
     const jsSubtask = subtasks?.find((s) => s.subtask_id === subtaskId);
     const jsUrl: string | undefined = jsSubtask?.js_instrumentation?.url;
 
-    let metricsResponse = '{}';
+    let responsePayload = '{}';
+
     if (jsUrl) {
       try {
-        metricsResponse = await this.executeJsInstrumentation(jsUrl);
-        log(
-          `JS instrumentation executed successfully, response length: ${metricsResponse.length}`,
+        const budgetMs = Math.max(
+          250,
+          Math.min(jsSubtask?.js_instrumentation?.timeout_ms ?? 2000, 4000),
         );
-      } catch (err) {
-        log('Failed to execute JS instrumentation (falling back to {})', err);
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), budgetMs);
+
+        const res = await this.fetch(jsUrl, {
+          method: 'GET',
+          credentials: 'include',
+          headers: {
+            accept: '*/*',
+            referer: 'https://x.com/',
+          } as any,
+          signal: ctrl.signal,
+        } as any);
+
+        clearTimeout(t);
+        responsePayload = await res.text();
+        if (!responsePayload || responsePayload.trim() === '')
+          responsePayload = '{}';
+        log(
+          `JS instrumentation fetched, response length: ${responsePayload.length}`,
+        );
+      } catch (e) {
+        log(
+          'JS instrumentation fetch failed, falling back to minimal payload. Error: %O',
+          e,
+        );
+        responsePayload = '{}';
       }
+    } else {
+      // No URL provided — send a non-empty minimal payload
+      responsePayload = JSON.stringify({
+        rf: { ae: Math.floor(Math.random() * 1e8).toString(16) },
+        s: 'https://x.com/i/flow/login',
+      });
     }
 
     return await api.sendFlowRequest({
@@ -521,187 +553,12 @@ export class TwitterUserAuth extends TwitterGuestAuth {
         {
           subtask_id: subtaskId,
           js_instrumentation: {
-            response: metricsResponse,
+            response: responsePayload,
             link: 'next_link',
           },
         },
       ],
     });
-  }
-
-  /**
-   * Maximum allowed size (in bytes) for the JS instrumentation script.
-   * Twitter's scripts are typically ~50-100KB. Anything significantly larger
-   * may indicate tampering or an unexpected response.
-   */
-  private static readonly JS_INSTRUMENTATION_MAX_SIZE = 512 * 1024; // 512KB
-
-  /**
-   * Fetches and executes the JS instrumentation script to generate browser
-   * fingerprinting data. The result is written to an input element named
-   * 'ui_metrics'.
-   *
-   * In browser environments, uses a hidden iframe with native DOM APIs.
-   * In Node.js, uses linkedom (for DOM) and the vm module for execution.
-   *
-   * @security This method executes **remote JavaScript** fetched from Twitter's servers.
-   * - In browsers, execution is isolated in a disposable iframe.
-   * - In Node.js, `vm.runInContext` is used for convenience, NOT for security.
-   *   Node's `vm` module provides NO security sandbox — a malicious script can
-   *   trivially escape the context (e.g., via `this.constructor.constructor('return process')()`).
-   *   The only real trust boundary is that scripts are fetched from Twitter's known CDN URLs.
-   *   Setting `process: undefined` etc. in the sandbox context is cosmetic and does not
-   *   prevent escape.
-   * - A maximum script size limit (512KB) and a 5-second timeout provide basic sanity checks.
-   */
-  private async executeJsInstrumentation(url: string): Promise<string> {
-    log(`Fetching JS instrumentation from: ${url}`);
-    const response = await this.fetch(url);
-    const scriptContent = await response.text();
-    log(`JS instrumentation script fetched, length: ${scriptContent.length}`);
-
-    if (scriptContent.length > TwitterUserAuth.JS_INSTRUMENTATION_MAX_SIZE) {
-      log(
-        `WARNING: JS instrumentation script exceeds size limit (${scriptContent.length} > ${TwitterUserAuth.JS_INSTRUMENTATION_MAX_SIZE}), skipping execution`,
-      );
-      return '{}';
-    }
-
-    if (typeof window !== 'undefined' && typeof document !== 'undefined') {
-      return this.executeJsInstrumentationBrowser(scriptContent);
-    }
-    return this.executeJsInstrumentationNode(scriptContent);
-  }
-
-  /**
-   * Execute JS instrumentation in a browser environment using a hidden iframe.
-   * The iframe provides natural isolation — the script gets its own document
-   * and window, and we can override setTimeout without affecting the host page.
-   */
-  private async executeJsInstrumentationBrowser(
-    scriptContent: string,
-  ): Promise<string> {
-    const iframe = document.createElement('iframe');
-    iframe.style.display = 'none';
-    document.body.appendChild(iframe);
-
-    try {
-      const iframeWin = iframe.contentWindow;
-      const iframeDoc = iframe.contentDocument;
-      if (!iframeWin || !iframeDoc) {
-        log('WARNING: Could not access iframe document/window');
-        return '{}';
-      }
-
-      // Add the ui_metrics input element that the script writes its result to
-      const input = iframeDoc.createElement('input');
-      input.name = 'ui_metrics';
-      input.type = 'hidden';
-      iframeDoc.body.appendChild(input);
-
-      // Override setTimeout to be synchronous — we need the result immediately
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (iframeWin as any).setTimeout = (fn: any) => fn();
-
-      // Execute the script in the iframe context via <script> tag injection
-      const script = iframeDoc.createElement('script');
-      script.textContent = scriptContent;
-      iframeDoc.body.appendChild(script);
-
-      const value = input.value;
-      if (value) {
-        log(`JS instrumentation result extracted, length: ${value.length}`);
-        return value;
-      }
-
-      log('WARNING: No ui_metrics value found after script execution');
-      return '{}';
-    } finally {
-      document.body.removeChild(iframe);
-    }
-  }
-
-  /**
-   * Execute JS instrumentation in Node.js using linkedom for DOM emulation
-   * and the vm module for sandboxed script execution.
-   *
-   * @security Node's `vm` module does NOT provide a security sandbox. A
-   * malicious script can trivially escape the context. The only real trust
-   * boundary is that scripts come from Twitter's CDN. The undefined globals
-   * (process, require, etc.) are cosmetic — they do not prevent sandbox escape.
-   */
-  private async executeJsInstrumentationNode(
-    scriptContent: string,
-  ): Promise<string> {
-    // Use linkedom to create a DOM environment with the required elements.
-    // The script needs: document.createElement, getElementsByName, getElementsByTagName,
-    // appendChild, removeChild, parentNode, children, innerText, lastElementChild, etc.
-    // We use parseHTML (not DOMParser) for a more complete window/document implementation.
-    const { parseHTML } = await import('linkedom');
-    const { document: doc, window: win } = parseHTML(
-      '<html><head></head><body><input name="ui_metrics" type="hidden" value="" /></body></html>',
-    );
-
-    // Polyfill getElementsByName if linkedom doesn't implement it.
-    if (typeof doc.getElementsByName !== 'function') {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (doc as any).getElementsByName = (name: string) =>
-        doc.querySelectorAll(`[name="${name}"]`);
-    }
-
-    // Execute the script in a sandboxed VM context.
-    // The script expects `document` and `window` as globals and uses `setTimeout`
-    // to schedule execution. We make setTimeout synchronous since we need the result
-    // immediately. The script checks document.readyState to decide between setTimeout
-    // and addEventListener('load'/'DOMContentLoaded').
-    const vm = await import('vm');
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const origSetTimeout = (win as any).setTimeout;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (win as any).setTimeout = (fn: any) => fn();
-
-    try {
-      Object.defineProperty(doc, 'readyState', {
-        value: 'complete',
-        writable: true,
-        configurable: true,
-      });
-    } catch {
-      // If readyState can't be set, the script will use event listeners
-    }
-
-    const sandbox = {
-      document: doc,
-      window: win,
-      Date: Date,
-      JSON: JSON,
-      parseInt: parseInt,
-      // Deny access to Node.js internals to limit sandbox escape surface
-      process: undefined,
-      require: undefined,
-      global: undefined,
-      globalThis: undefined,
-    };
-    vm.runInNewContext(scriptContent, sandbox, { timeout: 5000 });
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (win as any).setTimeout = origSetTimeout;
-
-    // Extract the result from the ui_metrics input element
-    const inputs = doc.getElementsByName('ui_metrics');
-    if (inputs && inputs.length > 0) {
-      const value =
-        (inputs[0] as HTMLInputElement).value ||
-        inputs[0].getAttribute('value');
-      if (value) {
-        log(`JS instrumentation result extracted, length: ${value.length}`);
-        return value;
-      }
-    }
-
-    log('WARNING: No ui_metrics value found after script execution');
-    return '{}';
   }
 
   private async handleEnterAlternateIdentifierSubtask(
@@ -974,12 +831,16 @@ export class TwitterUserAuth extends TwitterGuestAuth {
 
     // Generate x-client-transaction-id if enabled - real browsers send this during login.
     if (this.options?.experimental?.xClientTransactionId) {
-      const transactionId = await generateTransactionId(
-        onboardingTaskUrl,
-        this.fetch.bind(this),
-        'POST',
-      );
-      headers.set('x-client-transaction-id', transactionId);
+      try {
+        const transactionId = await generateTransactionId(
+          onboardingTaskUrl,
+          this.fetch.bind(this),
+          'POST',
+        );
+        headers.set('x-client-transaction-id', transactionId);
+      } catch (err) {
+        log('Failed to generate transaction ID during login (non-fatal):', err);
+      }
     }
 
     let res: Response;
