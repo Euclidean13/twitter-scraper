@@ -1,6 +1,6 @@
 {
   "name": "@tony_wmm365/twitter-scraper",
-  "version": "0.19.0-fork.14",
+  "version": "0.19.0-fork.15",
   "description": "A port of n0madic/twitter-scraper to Node.js.",
   "keywords": [
     "x",

@@ -514,11 +514,22 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       try {
         metricsResponse = await this.executeJsInstrumentation(jsUrl);
         log(
-          `JS instrumentation executed successfully, response length: ${metricsResponse.length}`,
+          `JS instrumentation executed, response length: ${metricsResponse.length}`,
         );
       } catch (err) {
-        log('Failed to execute JS instrumentation (falling back to {})', err);
+        log(
+          'JS instrumentation execution failed, using synthetic fallback:',
+          err,
+        );
       }
+    }
+
+    // If execution failed or returned empty, use a synthetic payload
+    if (!metricsResponse || metricsResponse === '{}') {
+      metricsResponse = TwitterUserAuth.generateSyntheticInstrumentation();
+      log(
+        `Using synthetic JS instrumentation, length: ${metricsResponse.length}`,
+      );
     }
 
     return await api.sendFlowRequest({
@@ -536,9 +547,43 @@ export class TwitterUserAuth extends TwitterGuestAuth {
   }
 
   /**
+   * Generate a synthetic JS instrumentation response that mimics what
+   * Twitter's script produces in a real browser. This is used as a fallback
+   * when script execution fails (e.g. in Bun where vm module is incomplete).
+   */
+  private static generateSyntheticInstrumentation(): string {
+    const now = Date.now();
+    // Simulate realistic performance timing values
+    const navigationStart = now - 2000 - Math.floor(Math.random() * 1000);
+    const domLoading = navigationStart + 100 + Math.floor(Math.random() * 200);
+    const domInteractive =
+      domLoading + 300 + Math.floor(Math.random() * 500);
+    const domComplete = domInteractive + 200 + Math.floor(Math.random() * 300);
+
+    return JSON.stringify({
+      rf: {
+        af07339baf460e78a4824c3a4e7896b9382de043625daa89c7e5a3e39e78dab2:
+          domComplete - navigationStart,
+        a73bf94bfb09ff2c26c2ae4f3e60d41f118505646dedd03e21fc30e16ee6508b:
+          -1,
+        ac5765e5b8aee29ff22ca0e8b3a5db15a9f003cd77e42f42f3bf6839a14c7561:
+          domInteractive - domLoading,
+        a61c91db5a53eccc58fb9be6f05a8a3d5a1e5ae90085d4808deaeafdf9eb82e6:
+          domComplete - domInteractive,
+        ae0e82b9f498c5cb498a6fcc29ef6fe45e0a508e86e0efc1c850bef4b1f83c06:
+          domLoading - navigationStart,
+        af5c75ce5486e1b0284f735c03177f00e311cf0bf8c39e3e38bbf7ba8fee118a: 0,
+        a328d87a33d7370caf34ff7486d4eee4fc0a2060dbbe93542e7a0a2f41a10814:
+          Math.floor(Math.random() * 10),
+        a7eaa498c21f9e3e2e25f063d5fc27c3bb1bfdd826903f75f3e41e80db4c8ebd:
+          now,
+      },
+      s: 'https://x.com/i/flow/login',
+    });
+  }
+
+  /**
    * Maximum allowed size (in bytes) for the JS instrumentation script.
-   * Twitter's scripts are typically ~50-100KB. Anything significantly larger
-   * may indicate tampering or an unexpected response.
    */
   private static readonly JS_INSTRUMENTATION_MAX_SIZE = 512 * 1024; // 512KB
 
@@ -546,9 +591,6 @@ export class TwitterUserAuth extends TwitterGuestAuth {
    * Fetches and executes the JS instrumentation script to generate browser
    * fingerprinting data. The result is written to an input element named
    * 'ui_metrics'.
-   *
-   * In browser environments, uses a hidden iframe with native DOM APIs.
-   * In Node.js, uses linkedom (for DOM) and the vm module for execution.
    */
   private async executeJsInstrumentation(url: string): Promise<string> {
     log(`Fetching JS instrumentation from: ${url}`);
@@ -605,7 +647,7 @@ export class TwitterUserAuth extends TwitterGuestAuth {
         return value;
       }
 
-      log('WARNING: No ui_metrics value found after script execution');
+      log('WARNING: No ui_metrics value found after browser script execution');
       return '{}';
     } finally {
       document.body.removeChild(iframe);
@@ -613,8 +655,8 @@ export class TwitterUserAuth extends TwitterGuestAuth {
   }
 
   /**
-   * Execute JS instrumentation in Node.js using linkedom for DOM emulation
-   * and the vm module for sandboxed script execution.
+   * Execute JS instrumentation in Node.js/Bun using linkedom for DOM emulation.
+   * Tries vm.runInNewContext first (Node.js), then Function constructor (Bun fallback).
    */
   private async executeJsInstrumentationNode(
     scriptContent: string,
@@ -629,8 +671,6 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       (doc as any).getElementsByName = (name: string) =>
         doc.querySelectorAll(`[name="${name}"]`);
     }
-
-    const vm = await import('vm');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const origSetTimeout = (win as any).setTimeout;
@@ -647,18 +687,55 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       // If readyState can't be set, the script will use event listeners
     }
 
-    const sandbox = {
-      document: doc,
-      window: win,
-      Date: Date,
-      JSON: JSON,
-      parseInt: parseInt,
-      process: undefined,
-      require: undefined,
-      global: undefined,
-      globalThis: undefined,
-    };
-    vm.runInNewContext(scriptContent, sandbox, { timeout: 5000 });
+    // Try vm.runInNewContext first (works in Node.js)
+    let vmSucceeded = false;
+    try {
+      const vm = await import('vm');
+      const sandbox = {
+        document: doc,
+        window: win,
+        Date: Date,
+        JSON: JSON,
+        parseInt: parseInt,
+        process: undefined,
+        require: undefined,
+        global: undefined,
+        globalThis: undefined,
+      };
+      vm.runInNewContext(scriptContent, sandbox, { timeout: 5000 });
+      vmSucceeded = true;
+      log('JS instrumentation executed via vm.runInNewContext');
+    } catch (vmErr) {
+      log('vm.runInNewContext failed, trying Function constructor:', vmErr);
+    }
+
+    // Fallback: Function constructor (works in Bun and other runtimes)
+    if (!vmSucceeded) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const execFn = new Function(
+          'document',
+          'window',
+          'setTimeout',
+          'Date',
+          'JSON',
+          'parseInt',
+          scriptContent,
+        );
+        execFn(
+          doc,
+          win,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (fn: any) => fn(),
+          Date,
+          JSON,
+          parseInt,
+        );
+        log('JS instrumentation executed via Function constructor');
+      } catch (fnErr) {
+        log('Function constructor execution also failed:', fnErr);
+      }
+    }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (win as any).setTimeout = origSetTimeout;
