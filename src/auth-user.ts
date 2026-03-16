@@ -253,10 +253,16 @@ export class TwitterUserAuth extends TwitterGuestAuth {
     twoFactorSecret?: string,
   ): Promise<void> {
     // Pre-flight: visit x.com to establish Cloudflare cookies and session context.
+    // A real browser visits the page before starting the login API flow, and skipping
+    // this step can trigger Twitter's anti-bot detection (error 399).
     await this.preflight();
 
-    // Always ensure we have a guest token via the activate endpoint.
-    await this.updateGuestToken();
+    // Only call guest/activate.json if preflight didn't set the guest token.
+    // Real browsers get the guest token from inline JS in the login page HTML,
+    // not from a separate API call.
+    if (!this.guestToken) {
+      await this.updateGuestToken();
+    }
 
     const credentials: TwitterUserAuthCredentials = {
       username,
@@ -281,7 +287,7 @@ export class TwitterUserAuth extends TwitterGuestAuth {
         const delay =
           configuredDelay !== undefined
             ? configuredDelay
-            : 200 + Math.floor(Math.random() * 400); // default: 200-600ms
+            : 1000 + Math.floor(Math.random() * 2000); // default: 1-3 seconds
         if (delay > 0) {
           log(`Waiting ${delay}ms before handling subtask: ${subtaskId}`);
           await new Promise((resolve) => setTimeout(resolve, delay));
@@ -915,13 +921,16 @@ export class TwitterUserAuth extends TwitterGuestAuth {
         2,
       ),
     );
+    // Match exact headers observed from real Chrome browser during login flow.
+    // Notable absences vs authenticated requests: no cache-control, no pragma,
+    // no x-csrf-token, no x-twitter-auth-type.
+    // Real browsers do NOT send x-csrf-token during the unauthenticated login flow.
+    // Sending it triggers bot detection (error 399).
     const headers = new Headers({
       accept: '*/*',
       'accept-language': 'en-US,en;q=0.9',
       'content-type': 'application/json',
-      'cache-control': 'no-cache',
       origin: 'https://x.com',
-      pragma: 'no-cache',
       priority: 'u=1, i',
       referer: 'https://x.com/',
       'sec-ch-ua': CHROME_SEC_CH_UA,
@@ -931,27 +940,25 @@ export class TwitterUserAuth extends TwitterGuestAuth {
       'sec-fetch-mode': 'cors',
       'sec-fetch-site': 'same-site',
       'user-agent': CHROME_USER_AGENT,
-      'x-twitter-auth-type': 'OAuth2Client',
       'x-twitter-active-user': 'yes',
       'x-twitter-client-language': 'en',
     });
-    // Install bearer token, guest token, cookies (but NOT the OAuth2Session
-    // auth-type that installTo() would add — during login we need OAuth2Client).
     await this.installAuthCredentials(headers);
-    await this.installCsrfToken(headers);
 
     // Generate x-client-transaction-id if enabled - real browsers send this during login.
     if (this.options?.experimental?.xClientTransactionId) {
-      try {
-        const transactionId = await generateTransactionId(
-          onboardingTaskUrl,
-          this.fetch.bind(this),
-          'POST',
-        );
-        headers.set('x-client-transaction-id', transactionId);
-      } catch (err) {
-        log('Failed to generate transaction ID during login (non-fatal):', err);
-      }
+      const transactionId = await generateTransactionId(
+        onboardingTaskUrl,
+        this.fetch.bind(this),
+        'POST',
+      );
+      headers.set('x-client-transaction-id', transactionId);
+    }
+
+    // Strip flow_name from the body: real browsers only send it in the URL query parameter.
+    const bodyData: Record<string, unknown> = { ...data };
+    if ('flow_name' in bodyData) {
+      delete bodyData.flow_name;
     }
 
     let res: Response;
@@ -962,7 +969,7 @@ export class TwitterUserAuth extends TwitterGuestAuth {
           credentials: 'include',
           method: 'POST',
           headers: headers,
-          body: JSON.stringify(data),
+          body: JSON.stringify(bodyData),
         },
       ];
 
