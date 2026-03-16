@@ -120,3 +120,4 @@ package-lock.json
 
 .env*.local
 *.har
+.DS_Store

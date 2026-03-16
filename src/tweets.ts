@@ -1,19 +1,19 @@
-import { addApiFeatures, requestApi, bearerToken2 } from './api';
+import { addApiFeatures, bearerToken2, requestApi } from './api';
+import { apiRequestFactory } from './api-data';
 import { TwitterAuth } from './auth';
+import { AuthenticationError } from './errors';
 import { getUserIdByScreenName } from './profile';
+import { getTweetTimeline } from './timeline-async';
+import { ListTimeline, parseListTimelineTweets } from './timeline-list';
 import { LegacyTweetRaw, QueryTweetsResponse } from './timeline-v1';
 import {
-  parseTimelineTweetsV2,
-  TimelineV2,
-  TimelineEntryItemContentRaw,
-  parseTimelineEntryItemContentRaw,
-  ThreadedConversation,
   parseThreadedConversation,
+  parseTimelineEntryItemContentRaw,
+  parseTimelineTweetsV2,
+  ThreadedConversation,
+  TimelineEntryItemContentRaw,
+  TimelineV2,
 } from './timeline-v2';
-import { getTweetTimeline } from './timeline-async';
-import { apiRequestFactory } from './api-data';
-import { ListTimeline, parseListTimelineTweets } from './timeline-list';
-import { AuthenticationError } from './errors';
 
 export interface Mention {
   id: string;
@@ -87,6 +87,17 @@ export interface Tweet {
   videos: Video[];
   views?: number;
   sensitiveContent?: boolean;
+  userProfile?: {
+    profileImageUrlHttps?: string;
+    profileBannerUrl?: string;
+    createdAt?: string;
+    favouritesCount?: number;
+    followersCount?: number;
+    friendsCount?: number;
+    listedCount?: number;
+    mediaCount?: number;
+    statusesCount?: number;
+  };
 }
 
 export type TweetQuery =
@@ -414,6 +425,7 @@ export async function getTweet(
   }
 
   const tweets = parseThreadedConversation(res.value);
+
   return tweets.find((tweet) => tweet.id === id) ?? null;
 }
 
