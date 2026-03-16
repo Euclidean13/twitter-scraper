@@ -487,64 +487,32 @@ export class TwitterUserAuth extends TwitterGuestAuth {
     });
   }
 
-  // IMPORTANT: Fetch and echo the JS instrumentation payload if the server asks for it.
-  // The simpler approach (fetch URL → echo response text) works more reliably than
-  // trying to execute the script in a linkedom/vm sandbox.
   private async handleJsInstrumentationSubtask(
     subtaskId: string,
     prev: TwitterUserAuthFlowResponse,
     _credentials: TwitterUserAuthCredentials,
     api: FlowSubtaskHandlerApi,
   ): Promise<FlowTokenResult> {
-    // Look for the JS instrumentation URL in subtasks or top-level response
+    // Extract the JS instrumentation URL from the subtask response.
+    // The script at this URL collects browser metrics (fingerprinting) that Twitter
+    // validates. Sending "{}" (empty) triggers bot detection (error 399).
     const subtasks = prev.subtasks as {
       subtask_id: string;
-      js_instrumentation?: { url: string; timeout_ms?: number };
+      js_instrumentation?: { url: string };
     }[];
     const jsSubtask = subtasks?.find((s) => s.subtask_id === subtaskId);
     const jsUrl: string | undefined = jsSubtask?.js_instrumentation?.url;
 
-    let responsePayload = '{}';
-
+    let metricsResponse = '{}';
     if (jsUrl) {
       try {
-        const budgetMs = Math.max(
-          250,
-          Math.min(jsSubtask?.js_instrumentation?.timeout_ms ?? 2000, 4000),
-        );
-        const ctrl = new AbortController();
-        const t = setTimeout(() => ctrl.abort(), budgetMs);
-
-        const res = await this.fetch(jsUrl, {
-          method: 'GET',
-          credentials: 'include',
-          headers: {
-            accept: '*/*',
-            referer: 'https://x.com/',
-          } as any,
-          signal: ctrl.signal,
-        } as any);
-
-        clearTimeout(t);
-        responsePayload = await res.text();
-        if (!responsePayload || responsePayload.trim() === '')
-          responsePayload = '{}';
+        metricsResponse = await this.executeJsInstrumentation(jsUrl);
         log(
-          `JS instrumentation fetched, response length: ${responsePayload.length}`,
+          `JS instrumentation executed successfully, response length: ${metricsResponse.length}`,
         );
-      } catch (e) {
-        log(
-          'JS instrumentation fetch failed, falling back to minimal payload. Error: %O',
-          e,
-        );
-        responsePayload = '{}';
+      } catch (err) {
+        log('Failed to execute JS instrumentation (falling back to {})', err);
       }
-    } else {
-      // No URL provided — send a non-empty minimal payload
-      responsePayload = JSON.stringify({
-        rf: { ae: Math.floor(Math.random() * 1e8).toString(16) },
-        s: 'https://x.com/i/flow/login',
-      });
     }
 
     return await api.sendFlowRequest({
@@ -553,12 +521,155 @@ export class TwitterUserAuth extends TwitterGuestAuth {
         {
           subtask_id: subtaskId,
           js_instrumentation: {
-            response: responsePayload,
+            response: metricsResponse,
             link: 'next_link',
           },
         },
       ],
     });
+  }
+
+  /**
+   * Maximum allowed size (in bytes) for the JS instrumentation script.
+   * Twitter's scripts are typically ~50-100KB. Anything significantly larger
+   * may indicate tampering or an unexpected response.
+   */
+  private static readonly JS_INSTRUMENTATION_MAX_SIZE = 512 * 1024; // 512KB
+
+  /**
+   * Fetches and executes the JS instrumentation script to generate browser
+   * fingerprinting data. The result is written to an input element named
+   * 'ui_metrics'.
+   *
+   * In browser environments, uses a hidden iframe with native DOM APIs.
+   * In Node.js, uses linkedom (for DOM) and the vm module for execution.
+   */
+  private async executeJsInstrumentation(url: string): Promise<string> {
+    log(`Fetching JS instrumentation from: ${url}`);
+    const response = await this.fetch(url);
+    const scriptContent = await response.text();
+    log(`JS instrumentation script fetched, length: ${scriptContent.length}`);
+
+    if (scriptContent.length > TwitterUserAuth.JS_INSTRUMENTATION_MAX_SIZE) {
+      log(
+        `WARNING: JS instrumentation script exceeds size limit (${scriptContent.length} > ${TwitterUserAuth.JS_INSTRUMENTATION_MAX_SIZE}), skipping execution`,
+      );
+      return '{}';
+    }
+
+    if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+      return this.executeJsInstrumentationBrowser(scriptContent);
+    }
+    return this.executeJsInstrumentationNode(scriptContent);
+  }
+
+  /**
+   * Execute JS instrumentation in a browser environment using a hidden iframe.
+   */
+  private async executeJsInstrumentationBrowser(
+    scriptContent: string,
+  ): Promise<string> {
+    const iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    document.body.appendChild(iframe);
+
+    try {
+      const iframeWin = iframe.contentWindow;
+      const iframeDoc = iframe.contentDocument;
+      if (!iframeWin || !iframeDoc) {
+        log('WARNING: Could not access iframe document/window');
+        return '{}';
+      }
+
+      const input = iframeDoc.createElement('input');
+      input.name = 'ui_metrics';
+      input.type = 'hidden';
+      iframeDoc.body.appendChild(input);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (iframeWin as any).setTimeout = (fn: any) => fn();
+
+      const script = iframeDoc.createElement('script');
+      script.textContent = scriptContent;
+      iframeDoc.body.appendChild(script);
+
+      const value = input.value;
+      if (value) {
+        log(`JS instrumentation result extracted, length: ${value.length}`);
+        return value;
+      }
+
+      log('WARNING: No ui_metrics value found after script execution');
+      return '{}';
+    } finally {
+      document.body.removeChild(iframe);
+    }
+  }
+
+  /**
+   * Execute JS instrumentation in Node.js using linkedom for DOM emulation
+   * and the vm module for sandboxed script execution.
+   */
+  private async executeJsInstrumentationNode(
+    scriptContent: string,
+  ): Promise<string> {
+    const { parseHTML } = await import('linkedom');
+    const { document: doc, window: win } = parseHTML(
+      '<html><head></head><body><input name="ui_metrics" type="hidden" value="" /></body></html>',
+    );
+
+    if (typeof doc.getElementsByName !== 'function') {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (doc as any).getElementsByName = (name: string) =>
+        doc.querySelectorAll(`[name="${name}"]`);
+    }
+
+    const vm = await import('vm');
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const origSetTimeout = (win as any).setTimeout;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (win as any).setTimeout = (fn: any) => fn();
+
+    try {
+      Object.defineProperty(doc, 'readyState', {
+        value: 'complete',
+        writable: true,
+        configurable: true,
+      });
+    } catch {
+      // If readyState can't be set, the script will use event listeners
+    }
+
+    const sandbox = {
+      document: doc,
+      window: win,
+      Date: Date,
+      JSON: JSON,
+      parseInt: parseInt,
+      process: undefined,
+      require: undefined,
+      global: undefined,
+      globalThis: undefined,
+    };
+    vm.runInNewContext(scriptContent, sandbox, { timeout: 5000 });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (win as any).setTimeout = origSetTimeout;
+
+    const inputs = doc.getElementsByName('ui_metrics');
+    if (inputs && inputs.length > 0) {
+      const value =
+        (inputs[0] as HTMLInputElement).value ||
+        inputs[0].getAttribute('value');
+      if (value) {
+        log(`JS instrumentation result extracted, length: ${value.length}`);
+        return value;
+      }
+    }
+
+    log('WARNING: No ui_metrics value found after script execution');
+    return '{}';
   }
 
   private async handleEnterAlternateIdentifierSubtask(
